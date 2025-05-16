@@ -339,12 +339,36 @@ fn reshape_lean_common(comptime T: anytype, input: *Tensor(T), modified_shape: [
 /// https://onnx.ai/onnx/operators/onnx__Reshape.html
 pub fn lowerReshape(
     b: *UOpBuilder,
-    A_id: usize, // input-tensor SSA ids
+    A_id: usize, // input-tensor SSA id
     out_shape: []const usize,
     out_dtype: DType, // promoted element type
 ) usize { // returns id of result buffer
 
-    const id_outBuf = b.push(.RESHAPE, out_dtype, &.{A_id}, Any{ .shape = out_shape });
+    // ── Set-up phase ────────────────────────────────────────────────────
+    _ = b.push(.SHAPE, .i32, &.{A_id}, null); // a_shape  (dbg only)
 
-    return id_outBuf; // SSA id of the output tensor
+    const id_viewA = b.push(.VIEW, out_dtype, &.{A_id}, Any{ .view_meta = .{ .shape = out_shape, .strides = &.{ 1, 1 } } });
+
+    const id_outBuf = b.push(.DEFINE_GLOBAL, out_dtype, &.{}, Any{ .shape = out_shape });
+
+    // ── Flat element loop ────────────────────────────────────────────────
+
+    var nelem: usize = 1;
+    for (out_shape) |dim| nelem *= dim;
+
+    const id_range = b.push(.RANGE, .i32, &.{}, Any{ .loop_bounds = .{ .start = 0, .end = nelem } });
+
+    const id_gepA = b.push(.GEP, out_dtype, &.{ id_viewA, id_range }, Any{ .mem_info = .{ .base = id_viewA, .offset = 0, .stride = 1 } });
+
+    const id_loadA = b.push(.LOAD, out_dtype, &.{id_gepA}, null);
+
+    const id_reshape = b.push(.RESHAPE, out_dtype, &.{id_loadA}, Any{ .shape = out_shape });
+
+    const id_gepO = b.push(.GEP, out_dtype, &.{ id_outBuf, id_range }, Any{ .mem_info = .{ .base = id_outBuf, .offset = 0, .stride = 1 } });
+
+    _ = b.push(.STORE, out_dtype, &.{ id_gepO, id_reshape }, null);
+
+    _ = b.push(.ENDRANGE, .bool, &.{id_range}, null);
+
+    return id_outBuf;
 }

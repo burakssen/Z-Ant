@@ -1,9 +1,7 @@
 const std = @import("std");
 const zant = @import("zant");
-
 const ViewInfo = @import("view_manager.zig").ViewInfo;
 const BufferInfo = @import("zig_renderer.zig").BufferInfo;
-
 const UOp = zant.uops.UOp;
 const DTypeInfo = zant.uops.DTypeInfo;
 
@@ -16,27 +14,28 @@ pub const RendererError = error{
 };
 
 /// Main entry point for rendering GEP operations
-pub fn manage(
+pub fn render(
     alloc: std.mem.Allocator,
     writer: anytype,
     uop: UOp,
     view_map: *std.AutoHashMap(usize, ViewInfo),
     _: *const std.AutoHashMap(usize, BufferInfo),
-    _: *const std.AutoHashMap(usize, []const u8),
+    ptr_map: *const std.AutoHashMap(usize, []const u8),
 ) !void {
     if (uop.op != .RESHAPE) return RendererError.InvalidOp;
     if (uop.src.len != 1) return RendererError.InvalidOp;
-
     if (uop.arg == null) return RendererError.NoAny;
+
     const shape = uop.arg.?.shape;
     if (shape.len == 0) return RendererError.RankMismatch;
 
+    // Calculate strides
     var strides = try alloc.alloc(isize, shape.len);
-    errdefer alloc.free(strides);
+    defer alloc.free(strides);
+    // No errdefer here as we'll be transferring ownership to the VIEW_META
 
     var stride: isize = 1;
     var i: usize = shape.len;
-
     while (i > 0) : (i -= 1) {
         strides[i - 1] = stride;
         stride *= @intCast(shape[i - 1]);
@@ -46,7 +45,8 @@ pub fn manage(
     const get_or_put_result = try view_map.getOrPut(src_id);
     const src_view = get_or_put_result.value_ptr.*;
 
-    // Create output view
+    // Create output view and transfer ownership of strides
+    // Directly use strides without duplicating, since free management happens in the test
     const out_view = ViewInfo{
         .dtype = src_view.dtype,
         .src = &.{src_id},
@@ -58,14 +58,12 @@ pub fn manage(
         },
     };
 
-    // Store the new view in the view map
+    // Store the new view in the view map - the strides ownership is now transferred
     try view_map.put(uop.id, out_view);
 
-    // Write the reshape operation
-    try writer.print(
-        \\// RESHAPE op {d}
-        \\// Source: {d}, Output shape: {any}
-        \\// Note: Reshape is a view-only operation; the underlying data remains unchanged
-        \\
-    , .{ uop.id, src_id, shape });
+    // Generate the code for the reshape operation
+    const result_var = ptr_map.get(uop.id) orelse return error.VariableNotFound;
+    const src_var = ptr_map.get(uop.src[0]) orelse return error.VariableNotFound;
+    const type_str = DTypeInfo.asString(uop.dtype);
+    try writer.print(" const {s}: {s} = {s}; // Reshape (uop {d})\n", .{ result_var, type_str, src_var, uop.id });
 }
